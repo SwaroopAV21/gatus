@@ -2740,3 +2740,89 @@ func TestResolveTunnelForClientConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestParseAndValidateConfigBytesWithFailedState(t *testing.T) {
+	cfg, err := parseAndValidateConfigBytes([]byte(`
+endpoints:
+  - name: expensive-api
+    url: https://twin.sh/health
+    interval: 1h
+    failed-state:
+      interval: 2m
+    conditions:
+      - "[STATUS] == 200"
+  - name: website
+    url: https://twin.sh/health
+    conditions:
+      - "[STATUS] == 200"
+`))
+	if err != nil {
+		t.Fatal("expected no error, got", err)
+	}
+	if cfg.Endpoints[0].FailedState == nil || cfg.Endpoints[0].FailedState.Interval != 2*time.Minute {
+		t.Errorf("expected failed-state.interval of endpoint %s to be 2m, got %+v", cfg.Endpoints[0].Name, cfg.Endpoints[0].FailedState)
+	}
+	if cfg.Endpoints[1].FailedState != nil {
+		t.Errorf("expected endpoint %s to have no failed-state configuration", cfg.Endpoints[1].Name)
+	}
+}
+
+func TestParseAndValidateConfigBytesWithInvalidFailedState(t *testing.T) {
+	scenarios := []struct {
+		name        string
+		config      string
+		expectedErr error
+	}{
+		{
+			name: "missing-interval",
+			config: `
+endpoints:
+  - name: expensive-api
+    url: https://twin.sh/health
+    interval: 1h
+    failed-state: {}
+    conditions:
+      - "[STATUS] == 200"
+`,
+			expectedErr: endpoint.ErrFailedStateWithInvalidInterval,
+		},
+		{
+			name: "interval-not-shorter-than-endpoint-interval",
+			config: `
+endpoints:
+  - name: expensive-api
+    url: https://twin.sh/health
+    interval: 5m
+    failed-state:
+      interval: 5m
+    conditions:
+      - "[STATUS] == 200"
+`,
+			expectedErr: endpoint.ErrFailedStateIntervalNotShorterThanInterval,
+		},
+		{
+			name: "external-endpoint",
+			config: `
+endpoints:
+  - name: website
+    url: https://twin.sh/health
+    conditions:
+      - "[STATUS] == 200"
+external-endpoints:
+  - name: ext
+    token: "potato"
+    failed-state:
+      interval: 1m
+`,
+			expectedErr: endpoint.ErrExternalEndpointWithFailedState,
+		},
+	}
+	for _, scenario := range scenarios {
+		t.Run(scenario.name, func(t *testing.T) {
+			_, err := parseAndValidateConfigBytes([]byte(scenario.config))
+			if !errors.Is(err, scenario.expectedErr) {
+				t.Fatalf("expected error %v, got %v", scenario.expectedErr, err)
+			}
+		})
+	}
+}

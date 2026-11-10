@@ -16,6 +16,10 @@ var (
 
 	// ErrExternalEndpointHeartbeatIntervalTooLow is the error with which Gatus will panic if an external endpoint's heartbeat interval is less than 10 seconds.
 	ErrExternalEndpointHeartbeatIntervalTooLow = errors.New("heartbeat interval must be at least 10 seconds")
+
+	// ErrExternalEndpointWithFailedState is the error with which Gatus will panic if an external endpoint is configured
+	// with a failed-state block. External endpoints are not checked by Gatus, so there is nothing to recheck.
+	ErrExternalEndpointWithFailedState = errors.New("failed-state is not supported on external endpoints, because their results are pushed to Gatus rather than checked by it")
 )
 
 // ExternalEndpoint is an endpoint whose result is pushed from outside Gatus, which means that
@@ -43,6 +47,10 @@ type ExternalEndpoint struct {
 	// Heartbeat is the configuration that checks if the external endpoint has received new results when it should have.
 	Heartbeat heartbeat.Config `yaml:"heartbeat,omitempty"`
 
+	// FailedState is not supported on external endpoints. The field only exists so that configuring it returns a clear
+	// validation error instead of being silently ignored.
+	FailedState *FailedState `yaml:"failed-state,omitempty"`
+
 	// NumberOfFailuresInARow is the number of unsuccessful evaluations in a row
 	NumberOfFailuresInARow int `yaml:"-"`
 
@@ -64,6 +72,9 @@ func (externalEndpoint *ExternalEndpoint) ValidateAndSetDefaults() error {
 	}
 	if len(externalEndpoint.Token) == 0 {
 		return ErrExternalEndpointWithNoToken
+	}
+	if externalEndpoint.FailedState != nil {
+		return ErrExternalEndpointWithFailedState
 	}
 	if externalEndpoint.Heartbeat.Interval != 0 && externalEndpoint.Heartbeat.Interval < 10*time.Second {
 		// If the heartbeat interval is set (non-0), it must be at least 10 seconds.

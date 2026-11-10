@@ -13,6 +13,12 @@ import (
 
 // monitorEndpoint a single endpoint in a loop
 func monitorEndpoint(ep *endpoint.Endpoint, cfg *config.Config, extraLabels []string, ctx context.Context) {
+	if ep.FailedState != nil {
+		// Endpoints with a failed-state configuration have their own loop, which also rechecks the endpoint more
+		// frequently while it is failing. Endpoints without one use the loop below, which is left untouched.
+		monitorEndpointWithFailedState(ep, cfg, extraLabels, ctx)
+		return
+	}
 	// Run it immediately on start
 	executeEndpoint(ep, cfg, extraLabels)
 	// Loop for the next executions
@@ -32,21 +38,30 @@ func monitorEndpoint(ep *endpoint.Endpoint, cfg *config.Config, extraLabels []st
 	// periodically like they are for normal endpoints.
 }
 
-func executeEndpoint(ep *endpoint.Endpoint, cfg *config.Config, extraLabels []string) {
+// executeEndpoint evaluates the endpoint's health and handles the result (metrics, storage and alerting).
+// Returns the result, or nil if the evaluation was skipped.
+func executeEndpoint(ep *endpoint.Endpoint, cfg *config.Config, extraLabels []string) *endpoint.Result {
 	// Acquire semaphore to limit concurrent endpoint monitoring
 	if err := monitoringSemaphore.Acquire(ctx, 1); err != nil {
 		// Only fails if context is cancelled (during shutdown)
 		logr.Debugf("[watchdog.executeEndpoint] Context cancelled, skipping execution: %s", err.Error())
-		return
+		return nil
 	}
 	defer monitoringSemaphore.Release(1)
 	// If there's a connectivity checker configured, check if Gatus has internet connectivity
 	if cfg.Connectivity != nil && cfg.Connectivity.Checker != nil && !cfg.Connectivity.Checker.IsConnected() {
 		logr.Infof("[watchdog.executeEndpoint] No connectivity; skipping execution")
-		return
+		return nil
 	}
 	logr.Debugf("[watchdog.executeEndpoint] Monitoring group=%s; endpoint=%s; key=%s", ep.Group, ep.Name, ep.Key())
 	result := ep.EvaluateHealth()
+	handleEndpointResult(ep, cfg, extraLabels, result)
+	logr.Debugf("[watchdog.executeEndpoint] Waiting for interval=%s before monitoring group=%s endpoint=%s (key=%s) again", ep.Interval, ep.Group, ep.Name, ep.Key())
+	return result
+}
+
+// handleEndpointResult publishes the metrics for, stores, logs and handles the alerting of an endpoint's result
+func handleEndpointResult(ep *endpoint.Endpoint, cfg *config.Config, extraLabels []string, result *endpoint.Result) {
 	if cfg.Metrics {
 		metrics.PublishMetricsForEndpoint(ep, result, extraLabels)
 	}
@@ -56,6 +71,15 @@ func executeEndpoint(ep *endpoint.Endpoint, cfg *config.Config, extraLabels []st
 	} else {
 		logr.Infof("[watchdog.executeEndpoint] Monitored group=%s; endpoint=%s; key=%s; success=%v; errors=%d; duration=%s", ep.Group, ep.Name, ep.Key(), result.Success, len(result.Errors), result.Duration.Round(time.Millisecond))
 	}
+	if !isUnderMaintenance(ep, cfg) {
+		HandleAlerting(ep, result, cfg.Alerting)
+	} else {
+		logr.Debug("[watchdog.executeEndpoint] Not handling alerting because currently in the maintenance window")
+	}
+}
+
+// isUnderMaintenance returns whether the global maintenance or one of the endpoint's maintenance windows is active
+func isUnderMaintenance(ep *endpoint.Endpoint, cfg *config.Config) bool {
 	inEndpointMaintenanceWindow := false
 	for _, maintenanceWindow := range ep.MaintenanceWindows {
 		if maintenanceWindow.IsUnderMaintenance() {
@@ -63,12 +87,7 @@ func executeEndpoint(ep *endpoint.Endpoint, cfg *config.Config, extraLabels []st
 			inEndpointMaintenanceWindow = true
 		}
 	}
-	if !cfg.Maintenance.IsUnderMaintenance() && !inEndpointMaintenanceWindow {
-		HandleAlerting(ep, result, cfg.Alerting)
-	} else {
-		logr.Debug("[watchdog.executeEndpoint] Not handling alerting because currently in the maintenance window")
-	}
-	logr.Debugf("[watchdog.executeEndpoint] Waiting for interval=%s before monitoring group=%s endpoint=%s (key=%s) again", ep.Interval, ep.Group, ep.Name, ep.Key())
+	return cfg.Maintenance.IsUnderMaintenance() || inEndpointMaintenanceWindow
 }
 
 // UpdateEndpointStatus persists the endpoint result in the storage

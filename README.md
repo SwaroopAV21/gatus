@@ -44,6 +44,7 @@ Have any feedback or questions? [Create a discussion](https://github.com/TwiN/ga
 - [Usage](#usage)
 - [Configuration](#configuration)
   - [Endpoints](#endpoints)
+    - [Failed state](#failed-state)
   - [External Endpoints](#external-endpoints)
   - [Suites (ALPHA)](#suites-alpha)
   - [Conditions](#conditions)
@@ -285,6 +286,8 @@ You can then configure alerts to be triggered when an endpoint is unhealthy once
 | `endpoints[].method`                            | Request method.                                                                                                                             | `GET`                      |
 | `endpoints[].conditions`                        | Conditions used to determine the health of the endpoint. <br />See [Conditions](#conditions).                                               | `[]`                       |
 | `endpoints[].interval`                          | Duration to wait between every status check.                                                                                                | `60s`                      |
+| `endpoints[].failed-state`                      | Optional configuration for rechecking the endpoint more often while it is failing. <br />See [Failed state](#failed-state).                 | `nil`                      |
+| `endpoints[].failed-state.interval`             | Duration to wait between rechecks while the endpoint is failing. Must be shorter than `interval`.                                           | Required `0`               |
 | `endpoints[].graphql`                           | Whether to wrap the body in a query param (`{"query":"$body"}`).                                                                            | `false`                    |
 | `endpoints[].body`                              | Request body.                                                                                                                               | `""`                       |
 | `endpoints[].headers`                           | Request headers.                                                                                                                            | `{}`                       |
@@ -316,6 +319,92 @@ You may use the following placeholders in the body (`endpoints[].body`):
 - `[ENDPOINT_URL]` (resolved from `endpoints[].url`)
 - `[LOCAL_ADDRESS]` (resolves to the local IP and port like `192.0.2.1:25` or `[2001:db8::1]:80`)
 - `[RANDOM_STRING_N]` (resolves to a random string of numbers and letters of length N (max: 8192))
+
+#### Failed state
+By default, an endpoint is checked every `interval`, whether it is healthy or not. For endpoints with a long interval
+(e.g. because they are expensive or rate limited), this means that it can take up to a full `interval` before Gatus
+notices that the endpoint has recovered, and that any alert stays open until then.
+
+The `failed-state` block lets you recheck an endpoint more often **only while it is failing**, so that recovery is
+noticed sooner:
+```yaml
+endpoints:
+  - name: expensive-api
+    url: "https://api.example.org/health"
+    interval: 1h
+    failed-state:
+      interval: 5m
+    conditions:
+      - "[STATUS] == 200"
+    alerts:
+      - type: slack
+        failure-threshold: 2
+        success-threshold: 2
+        minimum-reminder-interval: 6h
+        send-on-resolved: true
+```
+
+Rechecks exist only to notice recovery sooner, and are designed not to make alerting noisier:
+- **Regular checks are unchanged.** They still run every `interval`, on the same schedule, and are handled exactly as
+  they would be without `failed-state`. Endpoints without a `failed-state` block are not affected at all.
+- **An endpoint is in a failed state** from the moment a check fails, until a check succeeds **and** all of its
+  triggered alerts have been resolved. While in a failed state, it is rechecked every `failed-state.interval`, counted
+  from the last check (regular or recheck). A recheck is skipped if the next regular check would run first anyway.
+- **`failure-threshold` only counts regular checks.** A failed recheck is not counted as a failure, so an alert is
+  triggered after exactly the same number of regular checks as it would be without `failed-state`.
+- **Failed rechecks never send alerts or reminders.** Reminders (`minimum-reminder-interval`) are only sent by regular
+  checks, so they are sent no more often than they would be without `failed-state`.
+- **`success-threshold` counts rechecks.** A successful recheck is handled exactly like a successful regular check: it
+  is stored, counts toward `success-threshold`, and resolves the alert (and sends the `send-on-resolved` notification)
+  once the threshold is reached. Because the endpoint stays in a failed state until its alerts are resolved, an alert
+  is typically resolved about `success-threshold` × `failed-state.interval` after the endpoint recovers.
+- **`success-threshold` still means successes in a row.** A failed recheck resets the number of successes in a row
+  back to 0, without counting as a failure.
+- **Failed rechecks are not stored**, so they don't show up in the endpoint's history, uptime, events or metrics.
+  The one exception is the first failed recheck following a successful result (e.g. the endpoint went down again
+  before reaching `success-threshold`): that one is stored, so that the dashboard doesn't show the endpoint as healthy
+  while it is down. Every time the endpoint goes from healthy to failing, at most one failed recheck is stored.
+
+Here's what it looks like for the configuration above, if the endpoint goes down at 09:30 and recovers at 11:17:
+
+| Time                | Check   | Result | What happens                                                                                                    |
+|:--------------------|:--------|:-------|:----------------------------------------------------------------------------------------------------------------|
+| 09:00               | regular | ✅      | Stored.                                                                                                         |
+| 10:00               | regular | ❌      | Stored. 1 failure in a row (below `failure-threshold` of 2), so no alert yet. The endpoint enters failed state. |
+| 10:05, 10:10, …     | recheck | ❌      | Not stored, not counted as failures, no alert.                                                                  |
+| 10:55               | recheck | ❌      | Same as above. No recheck at 11:00, since the regular check runs then anyway.                                   |
+| 11:00               | regular | ❌      | Stored. 2 failures in a row: the alert is triggered and sent.                                                   |
+| 11:05, 11:10, 11:15 | recheck | ❌      | Not stored, no reminder.                                                                                        |
+| 11:20               | recheck | ✅      | Stored. 1 success in a row (below `success-threshold` of 2): the alert stays open, and rechecks continue.       |
+| 11:25               | recheck | ✅      | Stored. 2 successes in a row: the alert is resolved and the resolved notification is sent. Rechecks stop.       |
+| 12:00               | regular | ✅      | Stored. Back to checking every hour.                                                                            |
+
+The endpoint's history shows 09:00 ✅, 10:00 ❌, 11:00 ❌, 11:20 ✅, 11:25 ✅ and 12:00 ✅, and the alert is
+resolved at 11:25. Without `failed-state`, the endpoint would have been displayed as down until 12:00, and the alert
+would only have been resolved at 13:00 (the second successful check in a row).
+
+Things to keep in mind:
+- **Rechecks add load to the endpoint for as long as it is failing.** There is no limit on the number of rechecks:
+  with `interval: 1h` and `failed-state.interval: 5m`, a failing endpoint is requested up to 12 times per hour instead
+  of once, for as long as the outage lasts. If the endpoint is expensive, or is failing *because* it is overloaded,
+  every recheck adds to the problem, so pick a `failed-state.interval` that the endpoint (and any rate limit in front of
+  it) can sustain during an outage. Note that a recheck that is rejected by a rate limiter is a failed recheck, which
+  delays the detection of the recovery.
+- **A successful recheck is a real success.** If an endpoint fails a regular check but succeeds on a recheck before
+  reaching `failure-threshold`, the number of failures in a row is reset like it would be for any other successful
+  check. An endpoint that fails at every regular check but is healthy in between may therefore trigger its alert later
+  than it would without `failed-state`, or not at all.
+- **Successful rechecks count toward uptime like any other stored result.** In the example above, the 11:00-12:00 hour
+  contains 1 failed and 2 successful results.
+- **Maintenance windows:** rechecks still run while the endpoint's last result is a failure, and successful ones are
+  stored, but alerts are neither triggered nor resolved, just like for regular checks. An alert that is still open
+  doesn't keep the endpoint in a failed state during a maintenance window.
+- **Without alerting configured,** the endpoint is in a failed state only while its last stored result is a failure.
+- **On restart,** alerts that were triggered before the restart are restored, so if one of them is still open, the
+  endpoint stays in a failed state (and is rechecked) after its first check, even if that check succeeds.
+- `failed-state.interval` must be shorter than `interval`. For endpoints using the `[DOMAIN_EXPIRATION]` placeholder,
+  it must also be at least `5m`. `failed-state` is not supported on endpoints that are part of a [suite](#suites-alpha),
+  nor on [external endpoints](#external-endpoints).
 
 ### External Endpoints
 Unlike regular endpoints, external endpoints are not monitored by Gatus, but they are instead pushed programmatically.

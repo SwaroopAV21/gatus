@@ -25,6 +25,10 @@ var (
 	// ErrSuiteWithInvalidTimeout is the error returned when a suite has an invalid timeout
 	ErrSuiteWithInvalidTimeout = errors.New("suite timeout must be positive")
 
+	// ErrSuiteEndpointWithFailedState is the error returned when an endpoint in a suite has a failed-state block.
+	// Suite endpoints are executed together as part of the suite's schedule, so they cannot be rechecked on their own.
+	ErrSuiteEndpointWithFailedState = errors.New("failed-state is not supported on endpoints that are part of a suite")
+
 	// DefaultInterval is the default interval for suite execution
 	DefaultInterval = 10 * time.Minute
 
@@ -86,6 +90,9 @@ func (s *Suite) ValidateAndSetDefaults() error {
 			return fmt.Errorf("%w: duplicate endpoint name '%s'", ErrSuiteWithDuplicateEndpointNames, ep.Name)
 		}
 		endpointNames[ep.Name] = true
+		if ep.FailedState != nil {
+			return fmt.Errorf("invalid endpoint '%s': %w", ep.Name, ErrSuiteEndpointWithFailedState)
+		}
 		// Suite endpoints inherit the group from the suite
 		ep.Group = s.Group
 		// Validate each endpoint

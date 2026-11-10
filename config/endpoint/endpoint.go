@@ -109,6 +109,10 @@ type Endpoint struct {
 	// Interval is the duration to wait between every status check
 	Interval time.Duration `yaml:"interval,omitempty"`
 
+	// FailedState is the optional configuration for rechecking the endpoint more often while it is failing.
+	// See FailedState for details.
+	FailedState *FailedState `yaml:"failed-state,omitempty"`
+
 	// Conditions used to determine the health of the endpoint
 	Conditions []Condition `yaml:"conditions"`
 
@@ -241,6 +245,11 @@ func (e *Endpoint) ValidateAndSetDefaults() error {
 			return fmt.Errorf("%v: %w", ErrInvalidConditionFormat, err)
 		}
 	}
+	if e.FailedState != nil {
+		if err := e.FailedState.ValidateAndSetDefaults(e.Interval, e.Conditions); err != nil {
+			return err
+		}
+	}
 	for _, maintenanceWindow := range e.MaintenanceWindows {
 		if err := maintenanceWindow.ValidateAndSetDefaults(); err != nil {
 			return err
@@ -261,6 +270,16 @@ func (e *Endpoint) ValidateAndSetDefaults() error {
 		return err
 	}
 	return nil
+}
+
+// HasTriggeredAlert returns whether at least one of the endpoint's enabled alerts is currently triggered
+func (e *Endpoint) HasTriggeredAlert() bool {
+	for _, endpointAlert := range e.Alerts {
+		if endpointAlert.IsEnabled() && endpointAlert.Triggered {
+			return true
+		}
+	}
+	return false
 }
 
 // DisplayName returns an identifier made up of the Name and, if not empty, the Group.

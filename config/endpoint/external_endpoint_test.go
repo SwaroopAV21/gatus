@@ -92,6 +92,15 @@ func TestExternalEndpoint_ValidateAndSetDefaults(t *testing.T) {
 			},
 			wantErr: ErrEndpointWithNoName,
 		},
+		{
+			name: "failed-state-is-not-supported",
+			endpoint: &ExternalEndpoint{
+				Name:        "test-endpoint",
+				Token:       "valid-token",
+				FailedState: &FailedState{Interval: time.Minute},
+			},
+			wantErr: ErrExternalEndpointWithFailedState,
+		},
 	}
 
 	for _, tt := range tests {

@@ -1,6 +1,7 @@
 package suite
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -490,5 +491,27 @@ func TestResult_CalculateSuccess(t *testing.T) {
 				t.Errorf("Expected success=%v, got %v", tt.expectedSuccess, result.Success)
 			}
 		})
+	}
+}
+
+func TestSuite_ValidateAndSetDefaultsWithFailedStateOnEndpoint(t *testing.T) {
+	s := &Suite{
+		Name: "test-suite",
+		Endpoints: []*endpoint.Endpoint{
+			{
+				Name:        "endpoint1",
+				URL:         "https://example.org",
+				Interval:    time.Hour,
+				FailedState: &endpoint.FailedState{Interval: time.Minute},
+				Conditions:  []endpoint.Condition{"[STATUS] == 200"},
+			},
+		},
+	}
+	err := s.ValidateAndSetDefaults()
+	if !errors.Is(err, ErrSuiteEndpointWithFailedState) {
+		t.Fatalf("expected error %v, got %v", ErrSuiteEndpointWithFailedState, err)
+	}
+	if !strings.Contains(err.Error(), "endpoint1") {
+		t.Errorf("expected error to mention the endpoint's name, got %v", err)
 	}
 }
