@@ -25,6 +25,9 @@ var (
 	// ErrSuiteWithInvalidTimeout is the error returned when a suite has an invalid timeout
 	ErrSuiteWithInvalidTimeout = errors.New("suite timeout must be positive")
 
+	// ErrSuiteEndpointWithFailedState is the error with which Gatus will panic if an endpoint in a suite has a failed-state
+	ErrSuiteEndpointWithFailedState = errors.New("failed-state is not supported for endpoints in a suite, because they are executed on the suite's interval")
+
 	// DefaultInterval is the default interval for suite execution
 	DefaultInterval = 10 * time.Minute
 
@@ -88,6 +91,10 @@ func (s *Suite) ValidateAndSetDefaults() error {
 		endpointNames[ep.Name] = true
 		// Suite endpoints inherit the group from the suite
 		ep.Group = s.Group
+		// Suite endpoints are executed on the suite's interval, so a failed-state would have no effect
+		if ep.FailedState != nil {
+			return fmt.Errorf("invalid endpoint '%s': %w", ep.Name, ErrSuiteEndpointWithFailedState)
+		}
 		// Validate each endpoint
 		if err := ep.ValidateAndSetDefaults(); err != nil {
 			return fmt.Errorf("invalid endpoint '%s': %w", ep.Name, err)

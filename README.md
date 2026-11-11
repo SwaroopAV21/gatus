@@ -44,6 +44,7 @@ Have any feedback or questions? [Create a discussion](https://github.com/TwiN/ga
 - [Usage](#usage)
 - [Configuration](#configuration)
   - [Endpoints](#endpoints)
+    - [Failed state](#failed-state)
   - [External Endpoints](#external-endpoints)
   - [Suites (ALPHA)](#suites-alpha)
   - [Conditions](#conditions)
@@ -285,6 +286,8 @@ You can then configure alerts to be triggered when an endpoint is unhealthy once
 | `endpoints[].method`                            | Request method.                                                                                                                             | `GET`                      |
 | `endpoints[].conditions`                        | Conditions used to determine the health of the endpoint. <br />See [Conditions](#conditions).                                               | `[]`                       |
 | `endpoints[].interval`                          | Duration to wait between every status check.                                                                                                | `60s`                      |
+| `endpoints[].failed-state`                      | Configuration for checking the endpoint more frequently while it is failing. <br />See [Failed state](#failed-state).                       | Disabled                   |
+| `endpoints[].failed-state.interval`             | Duration to wait between recovery checks while the endpoint is failing. Must be lower than `interval`.                                      | Required `0`               |
 | `endpoints[].graphql`                           | Whether to wrap the body in a query param (`{"query":"$body"}`).                                                                            | `false`                    |
 | `endpoints[].body`                              | Request body.                                                                                                                               | `""`                       |
 | `endpoints[].headers`                           | Request headers.                                                                                                                            | `{}`                       |
@@ -316,6 +319,94 @@ You may use the following placeholders in the body (`endpoints[].body`):
 - `[ENDPOINT_URL]` (resolved from `endpoints[].url`)
 - `[LOCAL_ADDRESS]` (resolves to the local IP and port like `192.0.2.1:25` or `[2001:db8::1]:80`)
 - `[RANDOM_STRING_N]` (resolves to a random string of numbers and letters of length N (max: 8192))
+
+#### Failed state
+Some endpoints have to be checked on a long interval, for instance because the target is rate limited or because
+the health check is expensive. The downside is that once such an endpoint has failed, Gatus only notices that it has
+recovered on the next check, so the endpoint keeps being shown as down and its alert stays open for up to a full
+`interval` after it came back.
+
+`failed-state` lets you check an endpoint more frequently, but only while it is failing:
+```yaml
+endpoints:
+  - name: expensive-api
+    url: "https://api.example.org/health"
+    interval: 1h
+    failed-state:
+      interval: 5m
+    conditions:
+      - "[STATUS] == 200"
+    alerts:
+      - type: slack
+        failure-threshold: 2
+        success-threshold: 2
+        send-on-resolved: true
+```
+
+The checks executed every `interval` are called **regular checks**. They are executed on the same schedule, and
+handled exactly the same way, as they would be without `failed-state`. The additional checks executed every
+`failed-state.interval` are called **recovery checks**, and their only purpose is to notice a recovery sooner:
+- An endpoint is considered failing if the last result stored for it was a failure, or if it still has a triggered alert
+  (e.g. it has started succeeding again, but not enough times in a row to reach the `success-threshold` yet).
+- While an endpoint is failing, a recovery check is executed every `failed-state.interval`. Recovery checks do not shift
+  the schedule of the regular checks, and a recovery check is skipped if the next regular check is due before it.
+- Recovery checks keep being executed for as long as the endpoint is failing; there is no limit on the number of
+  recovery checks. Once the endpoint is no longer failing, it goes back to only being checked every `interval`.
+
+> ⚠️ A short `failed-state.interval` means more load on the target while it is down, which is usually when it is least
+> able to handle it. With the configuration above, the endpoint is checked 12 times per hour during an outage instead of
+> once. Pick a `failed-state.interval` that the target (and its rate limits) can comfortably handle for the whole
+> duration of an outage.
+
+**Interaction with alerting**
+
+Recovery checks can resolve alerts, but they never trigger alerts or send reminders:
+
+| Alert parameter             | Regular checks | Recovery checks                                                                                                                 |
+|:----------------------------|:---------------|:--------------------------------------------------------------------------------------------------------------------------------|
+| `failure-threshold`         | Counted        | Never counted. The time it takes for an alert to be triggered (`failure-threshold` × `interval`) is unchanged.                 |
+| `success-threshold`         | Counted        | Counted. The time it takes for an alert to be resolved drops to roughly `success-threshold` × `failed-state.interval`.          |
+| `minimum-reminder-interval` | May remind     | Never send reminders. Reminders can still only be sent on regular checks, so you won't get more reminders than you do today. |
+| `send-on-resolved`          | Sent           | Sent, just like when an alert is resolved by a regular check.                                                                   |
+
+**What is stored**
+
+To prevent the history, the events and the uptime from being flooded with failures that only happened because the
+endpoint was checked more often:
+- A failed recovery check is **discarded** if the last stored result was already a failure: it is not stored, it does not
+  count toward the uptime or the metrics, and it is not passed to the alerting logic. It only shows up in the logs
+  (with `check=recovery`).
+- A successful recovery check is stored and handled exactly like a successful regular check: it creates a `HEALTHY` event,
+  counts toward the uptime, the metrics and the `success-threshold`, and may resolve alerts.
+- A failed recovery check following a stored success (i.e. the endpoint went down again before the `success-threshold` was
+  reached) is stored, so that the endpoint isn't shown as healthy while it is down. It resets the number of successes in a
+  row, so the `success-threshold` must be reached again from scratch, but it does not count toward the `failure-threshold`
+  and does not send anything. Subsequent failed recovery checks are discarded again.
+
+For example, with the configuration above, if the endpoint goes down just before 10:00 and comes back at 11:17:
+| Time          | Check               | Outcome                                                                                              |
+|:--------------|:--------------------|:-----------------------------------------------------------------------------------------------------|
+| 10:00         | Regular, failed     | Stored. 1 failure in a row, below the `failure-threshold` of 2.                                      |
+| 10:05 – 10:55 | Recovery, failed    | Discarded. Still 1 failure in a row.                                                                 |
+| 11:00         | Regular, failed     | Stored. 2 failures in a row: the alert is triggered, exactly when it would be without `failed-state`. |
+| 11:05 – 11:15 | Recovery, failed    | Discarded. No reminders.                                                                             |
+| 11:20         | Recovery, succeeded | Stored. The endpoint is shown as healthy again. 1 success in a row, the alert is still triggered.    |
+| 11:25         | Recovery, succeeded | Stored. 2 successes in a row: the alert is resolved and the resolved notification is sent.           |
+| 12:00         | Regular             | The endpoint is no longer failing, so it is back to being checked every hour.                        |
+
+Without `failed-state`, the endpoint would have been shown as down until 12:00, and the alert would only have been
+resolved at 13:00.
+
+**Notes**
+- `failed-state.interval` must be greater than 0 and lower than `interval`. There is no other minimum, except that it must
+  be at least `5m` for endpoints using the `[DOMAIN_EXPIRATION]` placeholder, just like `interval`.
+- `failed-state` is not supported for endpoints in [suites](#suites-alpha), since they are executed on the suite's interval,
+  nor for [external endpoints](#external-endpoints), since their results are pushed to Gatus. Both result in a
+  configuration error.
+- During a [maintenance window](#maintenance), recovery checks behave like regular checks: results are stored as described
+  above, but alerting is not handled.
+- If an alert was triggered before Gatus restarted and is loaded back from the [storage](#storage), recovery checks resume
+  as soon as Gatus starts.
 
 ### External Endpoints
 Unlike regular endpoints, external endpoints are not monitored by Gatus, but they are instead pushed programmatically.

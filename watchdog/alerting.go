@@ -116,3 +116,30 @@ func handleAlertsToResolve(ep *endpoint.Endpoint, result *endpoint.Result, alert
 	}
 	ep.NumberOfFailuresInARow = 0
 }
+
+// handleFailedRecoveryCheck handles a failed recovery check (see recoveryCheck) whose result was stored, which only
+// happens when the endpoint went from healthy back to unhealthy before its triggered alerts could be resolved.
+//
+// This deliberately does NOT go through handleAlertsToTrigger: recovery checks must never trigger alerts or send
+// reminders, and must never count toward failure-threshold, so NumberOfFailuresInARow is left untouched.
+// The only thing it does is reset the success streak, so that success-threshold still requires that many successes
+// in a row before an alert is resolved.
+func handleFailedRecoveryCheck(ep *endpoint.Endpoint, alertingConfig *alerting.Config) {
+	if alertingConfig == nil {
+		// Consistent with HandleAlerting, which doesn't touch the counters when alerting isn't configured
+		return
+	}
+	if ep.NumberOfSuccessesInARow == 0 {
+		return
+	}
+	ep.NumberOfSuccessesInARow = 0
+	for _, endpointAlert := range ep.Alerts {
+		if !endpointAlert.IsEnabled() || !endpointAlert.Triggered {
+			continue
+		}
+		// Persist the reset of NumberOfSuccessesInARow, just like handleAlertsToResolve persists its increments
+		if err := store.Get().UpsertTriggeredEndpointAlert(ep, endpointAlert); err != nil {
+			logr.Errorf("[watchdog.handleFailedRecoveryCheck] Failed to update triggered endpoint alert for endpoint with key=%s: %s", ep.Key(), err.Error())
+		}
+	}
+}

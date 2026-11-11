@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/TwiN/gatus/v5/alerting/alert"
+	"github.com/TwiN/gatus/v5/config/endpoint/failedstate"
 	"github.com/TwiN/gatus/v5/config/endpoint/heartbeat"
 	"github.com/TwiN/gatus/v5/config/key"
 	"github.com/TwiN/gatus/v5/config/maintenance"
@@ -16,6 +17,9 @@ var (
 
 	// ErrExternalEndpointHeartbeatIntervalTooLow is the error with which Gatus will panic if an external endpoint's heartbeat interval is less than 10 seconds.
 	ErrExternalEndpointHeartbeatIntervalTooLow = errors.New("heartbeat interval must be at least 10 seconds")
+
+	// ErrExternalEndpointWithFailedState is the error with which Gatus will panic if an external endpoint is configured with a failed-state.
+	ErrExternalEndpointWithFailedState = errors.New("failed-state is not supported for external endpoints, because their results are pushed to Gatus rather than checked by Gatus on an interval")
 )
 
 // ExternalEndpoint is an endpoint whose result is pushed from outside Gatus, which means that
@@ -43,6 +47,12 @@ type ExternalEndpoint struct {
 	// Heartbeat is the configuration that checks if the external endpoint has received new results when it should have.
 	Heartbeat heartbeat.Config `yaml:"heartbeat,omitempty"`
 
+	// FailedState is not supported for external endpoints.
+	//
+	// This field only exists so that a failed-state block configured on an external endpoint results in a clear
+	// validation error instead of being silently ignored.
+	FailedState *failedstate.Config `yaml:"failed-state,omitempty"`
+
 	// NumberOfFailuresInARow is the number of unsuccessful evaluations in a row
 	NumberOfFailuresInARow int `yaml:"-"`
 
@@ -64,6 +74,9 @@ func (externalEndpoint *ExternalEndpoint) ValidateAndSetDefaults() error {
 	}
 	if len(externalEndpoint.Token) == 0 {
 		return ErrExternalEndpointWithNoToken
+	}
+	if externalEndpoint.FailedState != nil {
+		return ErrExternalEndpointWithFailedState
 	}
 	if externalEndpoint.Heartbeat.Interval != 0 && externalEndpoint.Heartbeat.Interval < 10*time.Second {
 		// If the heartbeat interval is set (non-0), it must be at least 10 seconds.

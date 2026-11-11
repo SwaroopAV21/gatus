@@ -20,6 +20,7 @@ import (
 	"github.com/TwiN/gatus/v5/alerting/alert"
 	"github.com/TwiN/gatus/v5/client"
 	"github.com/TwiN/gatus/v5/config/endpoint/dns"
+	"github.com/TwiN/gatus/v5/config/endpoint/failedstate"
 	sshconfig "github.com/TwiN/gatus/v5/config/endpoint/ssh"
 	"github.com/TwiN/gatus/v5/config/endpoint/ui"
 	"github.com/TwiN/gatus/v5/config/gontext"
@@ -75,6 +76,19 @@ var (
 	// This is because the free whois service we are using should not be abused, especially considering the fact that
 	// the data takes a while to be updated.
 	ErrInvalidEndpointIntervalForDomainExpirationPlaceholder = errors.New("the minimum interval for an endpoint with a condition using the " + DomainExpirationPlaceholder + " placeholder is 300s (5m)")
+
+	// ErrInvalidFailedStateInterval is the error with which Gatus will panic if an endpoint has a failed-state block
+	// without a positive failed-state.interval
+	ErrInvalidFailedStateInterval = errors.New("failed-state.interval must be set to a duration greater than 0 when failed-state is configured")
+
+	// ErrFailedStateIntervalNotLowerThanInterval is the error with which Gatus will panic if an endpoint's
+	// failed-state.interval is not lower than its interval, in which case the failed-state would have no effect
+	ErrFailedStateIntervalNotLowerThanInterval = errors.New("failed-state.interval must be lower than the endpoint's interval")
+
+	// ErrInvalidFailedStateIntervalForDomainExpirationPlaceholder is the error with which Gatus will panic if an
+	// endpoint has both a failed-state.interval smaller than 5 minutes and a condition with DomainExpirationPlaceholder.
+	// See ErrInvalidEndpointIntervalForDomainExpirationPlaceholder for the reasoning.
+	ErrInvalidFailedStateIntervalForDomainExpirationPlaceholder = errors.New("the minimum failed-state.interval for an endpoint with a condition using the " + DomainExpirationPlaceholder + " placeholder is 300s (5m)")
 )
 
 // Endpoint is the configuration of a service to be monitored
@@ -108,6 +122,11 @@ type Endpoint struct {
 
 	// Interval is the duration to wait between every status check
 	Interval time.Duration `yaml:"interval,omitempty"`
+
+	// FailedState is the configuration for checking the endpoint more frequently while it is failing.
+	// Only the recovery is detected sooner; failure alerts and reminders are still only sent from checks
+	// executed on the regular Interval.
+	FailedState *failedstate.Config `yaml:"failed-state,omitempty"`
 
 	// Conditions used to determine the health of the endpoint
 	Conditions []Condition `yaml:"conditions"`
@@ -241,6 +260,9 @@ func (e *Endpoint) ValidateAndSetDefaults() error {
 			return fmt.Errorf("%v: %w", ErrInvalidConditionFormat, err)
 		}
 	}
+	if err := e.validateFailedState(); err != nil {
+		return err
+	}
 	for _, maintenanceWindow := range e.MaintenanceWindows {
 		if err := maintenanceWindow.ValidateAndSetDefaults(); err != nil {
 			return err
@@ -259,6 +281,28 @@ func (e *Endpoint) ValidateAndSetDefaults() error {
 	_, err := http.NewRequest(e.Method, e.URL, bytes.NewBuffer([]byte(e.getParsedBody())))
 	if err != nil {
 		return err
+	}
+	return nil
+}
+
+// validateFailedState validates the failed-state configuration, if any.
+// Must be called after the default Interval has been set.
+func (e *Endpoint) validateFailedState() error {
+	if e.FailedState == nil {
+		return nil
+	}
+	if e.FailedState.Interval <= 0 {
+		return fmt.Errorf("%w (failed-state.interval=%s)", ErrInvalidFailedStateInterval, e.FailedState.Interval)
+	}
+	if e.FailedState.Interval >= e.Interval {
+		return fmt.Errorf("%w (failed-state.interval=%s, interval=%s)", ErrFailedStateIntervalNotLowerThanInterval, e.FailedState.Interval, e.Interval)
+	}
+	if e.FailedState.Interval < 5*time.Minute {
+		for _, c := range e.Conditions {
+			if c.hasDomainExpirationPlaceholder() {
+				return fmt.Errorf("%w (failed-state.interval=%s)", ErrInvalidFailedStateIntervalForDomainExpirationPlaceholder, e.FailedState.Interval)
+			}
+		}
 	}
 	return nil
 }

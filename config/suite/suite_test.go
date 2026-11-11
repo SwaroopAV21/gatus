@@ -1,11 +1,13 @@
 package suite
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/TwiN/gatus/v5/config/endpoint"
+	"github.com/TwiN/gatus/v5/config/endpoint/failedstate"
 	"github.com/TwiN/gatus/v5/config/gontext"
 )
 
@@ -490,5 +492,27 @@ func TestResult_CalculateSuccess(t *testing.T) {
 				t.Errorf("Expected success=%v, got %v", tt.expectedSuccess, result.Success)
 			}
 		})
+	}
+}
+
+func TestSuite_ValidateAndSetDefaultsWithFailedStateOnEndpoint(t *testing.T) {
+	suite := &Suite{
+		Name: "suite",
+		Endpoints: []*endpoint.Endpoint{
+			{
+				Name:        "endpoint",
+				URL:         "https://example.org",
+				Interval:    time.Hour,
+				FailedState: &failedstate.Config{Interval: time.Minute},
+				Conditions:  []endpoint.Condition{"[STATUS] == 200"},
+			},
+		},
+	}
+	err := suite.ValidateAndSetDefaults()
+	if !errors.Is(err, ErrSuiteEndpointWithFailedState) {
+		t.Fatalf("expected error %v, got %v", ErrSuiteEndpointWithFailedState, err)
+	}
+	if !strings.Contains(err.Error(), "invalid endpoint 'endpoint'") {
+		t.Errorf("expected error to mention the endpoint name, got %q", err.Error())
 	}
 }
