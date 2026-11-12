@@ -88,6 +88,10 @@ func (s *Suite) ValidateAndSetDefaults() error {
 		endpointNames[ep.Name] = true
 		// Suite endpoints inherit the group from the suite
 		ep.Group = s.Group
+		// Suite endpoints are executed as part of their suite, so they can't be rechecked on their own
+		if ep.FailedState != nil {
+			return fmt.Errorf("invalid endpoint '%s': %w", ep.Name, endpoint.ErrFailedStateNotSupportedForSuiteEndpoints)
+		}
 		// Validate each endpoint
 		if err := ep.ValidateAndSetDefaults(); err != nil {
 			return fmt.Errorf("invalid endpoint '%s': %w", ep.Name, err)

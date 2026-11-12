@@ -119,6 +119,7 @@ Have any feedback or questions? [Create a discussion](https://github.com/TwiN/ga
 - [FAQ](#faq)
   - [Sending a GraphQL request](#sending-a-graphql-request)
   - [Recommended interval](#recommended-interval)
+  - [Checking failing endpoints more often](#checking-failing-endpoints-more-often)
   - [Default timeouts](#default-timeouts)
   - [Monitoring a TCP endpoint](#monitoring-a-tcp-endpoint)
   - [Monitoring a UDP endpoint](#monitoring-a-udp-endpoint)
@@ -285,6 +286,8 @@ You can then configure alerts to be triggered when an endpoint is unhealthy once
 | `endpoints[].method`                            | Request method.                                                                                                                             | `GET`                      |
 | `endpoints[].conditions`                        | Conditions used to determine the health of the endpoint. <br />See [Conditions](#conditions).                                               | `[]`                       |
 | `endpoints[].interval`                          | Duration to wait between every status check.                                                                                                | `60s`                      |
+| `endpoints[].failed-state`                      | Only applies while the endpoint is failing. <br />See [Checking failing endpoints more often](#checking-failing-endpoints-more-often).      | `{}`                       |
+| `endpoints[].failed-state.interval`             | Duration to wait between rechecks while the endpoint is failing. Must be shorter than `endpoints[].interval`.                               | Required                   |
 | `endpoints[].graphql`                           | Whether to wrap the body in a query param (`{"query":"$body"}`).                                                                            | `false`                    |
 | `endpoints[].body`                              | Request body.                                                                                                                               | `""`                       |
 | `endpoints[].headers`                           | Request headers.                                                                                                                            | `{}`                       |
@@ -846,6 +849,9 @@ endpoints:
 
 > 📝 If an alerting provider is not properly configured, all alerts configured with the provider's type will be
 > ignored.
+
+> 📝 If an endpoint has `failed-state` configured, see [Checking failing endpoints more often](#checking-failing-endpoints-more-often)
+> for how rechecks interact with `failure-threshold`, `success-threshold` and `minimum-reminder-interval`.
 
 | Parameter                  | Description                                                                                                                             | Default |
 |:---------------------------|:----------------------------------------------------------------------------------------------------------------------------------------|:--------|
@@ -2879,6 +2885,9 @@ endpoints:
         timezone: "Europe/Berlin"
 ```
 
+> 📝 For endpoints with `failed-state` configured, see [Checking failing endpoints more often](#checking-failing-endpoints-more-often)
+> for how rechecks behave during maintenance windows.
+
 
 ### Security
 | Parameter        | Description                  | Default |
@@ -3152,6 +3161,92 @@ higher interval.
 As a rule of thumb, I personally set the interval for more complex health checks to `5m` (5 minutes) and
 simple health checks used for alerting (PagerDuty/Twilio) to `30s`.
 
+
+### Checking failing endpoints more often
+Some endpoints have to be checked infrequently, for instance because they are rate limited or expensive to query.
+The drawback is that once such an endpoint fails, Gatus only notices that it has recovered at the next check, up to a full
+`interval` later. Until then, the dashboard shows the endpoint as down and triggered alerts remain open.
+
+`failed-state` allows you to recheck an endpoint more often, but only while it is failing:
+```yaml
+endpoints:
+  - name: expensive-api
+    url: "https://api.example.org/health"
+    interval: 1h
+    failed-state:
+      interval: 5m
+    conditions:
+      - "[STATUS] == 200"
+    alerts:
+      - type: slack
+        failure-threshold: 2
+        success-threshold: 2
+        minimum-reminder-interval: 3h
+        send-on-resolved: true
+```
+
+An endpoint is considered failing if its last stored result was a failure, or if one of its alerts is still triggered
+(i.e. it has started recovering, but hasn't reached the alert's `success-threshold` yet). While it is failing, the endpoint
+is rechecked every `failed-state.interval`. Regular checks keep running every `interval` on the same schedule as before,
+and once the endpoint is healthy and all of its alerts are resolved, rechecks stop.
+
+Rechecks only exist to notice a recovery sooner, so they never make alerting noisier:
+
+| Recheck outcome                                                                    | Stored (history, uptime, metrics)                                              | Effect on alerting                                                                                                                    |
+|:-----------------------------------------------------------------------------------|:-------------------------------------------------------------------------------|:--------------------------------------------------------------------------------------------------------------------------------------|
+| Fails, and the last stored result was a failure                                    | No, the result is discarded                                                    | None. It doesn't count toward `failure-threshold`, and never triggers an alert or sends a reminder.                                   |
+| Succeeds                                                                           | Yes                                                                            | Same as a successful regular check: counts toward `success-threshold`, resolves alerts and sends the `send-on-resolved` notification. |
+| Fails, but the last stored result was a success (i.e. the endpoint was recovering) | Yes, so that the dashboard doesn't show the endpoint as healthy while it isn't | Only resets the success streak. It doesn't count toward `failure-threshold`, and never triggers an alert or sends a reminder.         |
+
+Here's how this plays out with the thresholds of the example above:
+- **Triggering**: Only regular checks count toward `failure-threshold`, so the alert is triggered by the 2nd failed
+  regular check in a row (1 hour after the first failure), exactly when it would be triggered without `failed-state`.
+  Note that a successful recheck is a real success, so it resets the count of failures in a row just like a successful
+  regular check would.
+- **Reminders**: Only regular checks send reminders, so they are sent exactly as they would be without `failed-state`
+  (here, every 3 hours while the endpoint is still down).
+- **Resolving**: Successful rechecks count toward `success-threshold`, so once the endpoint has recovered, the alert is
+  resolved after 2 successful checks in a row, i.e. within roughly `success-threshold × failed-state.interval` (10 minutes)
+  rather than `success-threshold × interval` (up to 2 hours).
+- **History and uptime**: An outage results in the same failed results as without `failed-state` (one per regular check).
+  The successful rechecks needed to reach `success-threshold` are stored like any other result, so they are included in
+  the uptime, which is calculated from stored results. If the endpoint keeps flapping while recovering, each interruption
+  stores one failed result (consecutive failed rechecks are still discarded).
+
+Additional details:
+- Rechecks are subject to the same [`concurrency`](#concurrency) limit as regular checks.
+- A recheck is never scheduled at the same time as (or after) the next regular check; the regular check takes its place.
+- While an endpoint is failing, it is rechecked every `failed-state.interval` for as long as the outage lasts, so make sure
+  the target can handle that rate even when it is unhealthy.
+- Endpoints without alerts (or without an `alerting` configuration) benefit as well: the recovery shows up on the
+  dashboard at the next recheck. Since there is no alert to resolve, rechecks stop at the first successful result.
+- With a persistent [storage](#storage) type, alerts that were triggered before a restart are loaded as triggered, so
+  rechecks resume until they are resolved.
+
+**Maintenance windows**: During a [maintenance window](#maintenance) (global or per-endpoint), results are stored as
+usual, but alerting is not handled, so a triggered alert can't be resolved until the window is over. Rechecks behave as
+follows:
+1. While the last stored result is a failure, rechecks keep running during the window, so a recovery still shows up on
+   the dashboard at the next recheck. Failed rechecks are still discarded.
+2. As soon as a successful result is stored during the window, rechecks stop, even if an alert is still triggered,
+   because they couldn't resolve it anyway and would only store more successful results.
+3. Rechecks don't resume on their own when the window ends: the next regular check (up to `interval` later) is handled
+   normally, counts toward `success-threshold` and, if an alert is still triggered, rechecks resume from there until
+   it is resolved.
+
+This means an alert that was triggered before a maintenance window, for an endpoint that recovered during the window,
+is resolved at the earliest by the first regular check after the window ends (or by the rechecks that follow it if
+`success-threshold` is greater than 1), not at the end of the window itself.
+
+The configuration is rejected on startup if:
+- `failed-state` is present with no value, e.g. a bare `failed-state:` line. This is usually an indentation mistake,
+  in which case `interval` would otherwise silently become the endpoint's `interval` rather than `failed-state.interval`.
+  The same applies to `failed-state: ~` and `failed-state: null`, including through YAML anchors and merge keys.
+- `failed-state.interval` is not set or is not greater than 0
+- `failed-state.interval` is not shorter than `interval`
+- `failed-state.interval` is lower than `5m` and a condition uses the `[DOMAIN_EXPIRATION]` placeholder (see [Monitoring domain expiration](#monitoring-domain-expiration))
+- `failed-state` is set on an endpoint that is part of a [suite](#suites-alpha), since suite endpoints are executed as part of their suite
+- `failed-state` is set on an [external endpoint](#external-endpoints), since their results are pushed to Gatus rather than checked by it
 
 ### Default timeouts
 | Endpoint type | Timeout |

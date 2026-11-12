@@ -8,6 +8,7 @@ import (
 	"github.com/TwiN/gatus/v5/config/endpoint/heartbeat"
 	"github.com/TwiN/gatus/v5/config/key"
 	"github.com/TwiN/gatus/v5/config/maintenance"
+	"gopkg.in/yaml.v3"
 )
 
 var (
@@ -43,6 +44,11 @@ type ExternalEndpoint struct {
 	// Heartbeat is the configuration that checks if the external endpoint has received new results when it should have.
 	Heartbeat heartbeat.Config `yaml:"heartbeat,omitempty"`
 
+	// FailedState is NOT supported for external endpoints, because their results are pushed to Gatus rather than
+	// checked by it. It is only parsed so that configuring it results in a validation error instead of being
+	// silently ignored.
+	FailedState *FailedState `yaml:"failed-state,omitempty"`
+
 	// NumberOfFailuresInARow is the number of unsuccessful evaluations in a row
 	NumberOfFailuresInARow int `yaml:"-"`
 
@@ -55,12 +61,37 @@ type ExternalEndpoint struct {
 	// call, or every heartbeat tick / pushed result would see a zero value and
 	// re-send the alert, ignoring minimum-reminder-interval (#1765).
 	LastReminderSent time.Time `yaml:"-"`
+
+	// failedStateSetToNull is whether the failed-state key was present in the configuration, but with no value.
+	// See UnmarshalYAML.
+	failedStateSetToNull bool
+}
+
+// UnmarshalYAML decodes the external endpoint exactly like the default decoder would, and additionally records whether
+// the failed-state key was present with no value, so that ValidateAndSetDefaults rejects it like any other failed-state
+// configuration instead of silently ignoring it. See isFailedStateSetToNull.
+func (externalEndpoint *ExternalEndpoint) UnmarshalYAML(node *yaml.Node) error {
+	// externalEndpointWithoutUnmarshaler has the same fields as ExternalEndpoint but not its methods, which prevents
+	// infinite recursion
+	type externalEndpointWithoutUnmarshaler ExternalEndpoint
+	if err := node.Decode((*externalEndpointWithoutUnmarshaler)(externalEndpoint)); err != nil {
+		return err
+	}
+	isNull, err := isFailedStateSetToNull(node)
+	if err != nil {
+		return err
+	}
+	externalEndpoint.failedStateSetToNull = isNull
+	return nil
 }
 
 // ValidateAndSetDefaults validates the ExternalEndpoint and sets the default values
 func (externalEndpoint *ExternalEndpoint) ValidateAndSetDefaults() error {
 	if err := validateEndpointNameGroupAndAlerts(externalEndpoint.Name, externalEndpoint.Group, externalEndpoint.Alerts); err != nil {
 		return err
+	}
+	if externalEndpoint.FailedState != nil || externalEndpoint.failedStateSetToNull {
+		return ErrFailedStateNotSupportedForExternalEndpoints
 	}
 	if len(externalEndpoint.Token) == 0 {
 		return ErrExternalEndpointWithNoToken

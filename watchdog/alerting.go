@@ -116,3 +116,25 @@ func handleAlertsToResolve(ep *endpoint.Endpoint, result *endpoint.Result, alert
 	}
 	ep.NumberOfFailuresInARow = 0
 }
+
+// handleFailedStateRecheckFailure handles a failed failed-state recheck that followed a successful result, which can
+// only happen while the endpoint is recovering (i.e. at least one alert is still triggered because its
+// success-threshold hasn't been reached yet).
+//
+// Rechecks only exist to notice a recovery sooner, so unlike HandleAlerting with a failed result, this only interrupts
+// the success streak: it doesn't increment NumberOfFailuresInARow, and it never triggers an alert or sends a reminder.
+func handleFailedStateRecheckFailure(ep *endpoint.Endpoint, alertingConfig *alerting.Config) {
+	if alertingConfig == nil || ep.NumberOfSuccessesInARow == 0 {
+		return
+	}
+	ep.NumberOfSuccessesInARow = 0
+	for _, endpointAlert := range ep.Alerts {
+		if !endpointAlert.IsEnabled() || !endpointAlert.Triggered {
+			continue
+		}
+		// Persist NumberOfSuccessesInARow, otherwise the interrupted success streak would be restored on restart
+		if err := store.Get().UpsertTriggeredEndpointAlert(ep, endpointAlert); err != nil {
+			logr.Errorf("[watchdog.handleFailedStateRecheckFailure] Failed to update triggered endpoint alert for endpoint with key=%s: %s", ep.Key(), err.Error())
+		}
+	}
+}

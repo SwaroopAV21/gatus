@@ -2740,3 +2740,164 @@ func TestResolveTunnelForClientConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestParseAndValidateConfigBytesWithFailedState(t *testing.T) {
+	config, err := parseAndValidateConfigBytes([]byte(`
+endpoints:
+  - name: expensive
+    url: https://example.org
+    interval: 1h
+    failed-state:
+      interval: 2m
+    conditions:
+      - "[STATUS] == 200"
+  - name: regular
+    url: https://example.org
+    conditions:
+      - "[STATUS] == 200"
+`))
+	if err != nil {
+		t.Fatal("expected no error, got", err.Error())
+	}
+	if config.Endpoints[0].FailedState == nil || config.Endpoints[0].FailedState.Interval != 2*time.Minute {
+		t.Errorf("expected failed-state.interval to be 2m, got %+v", config.Endpoints[0].FailedState)
+	}
+	if config.Endpoints[1].FailedState != nil {
+		t.Errorf("expected failed-state to be nil when not configured, got %+v", config.Endpoints[1].FailedState)
+	}
+}
+
+func TestParseAndValidateConfigBytesWithInvalidFailedState(t *testing.T) {
+	scenarios := []struct {
+		name        string
+		yaml        string
+		expectedErr error
+	}{
+		{
+			name: "missing-interval",
+			yaml: `
+endpoints:
+  - name: website
+    url: https://example.org
+    interval: 1h
+    failed-state: {}
+    conditions:
+      - "[STATUS] == 200"`,
+			expectedErr: endpoint.ErrFailedStateWithInvalidInterval,
+		},
+		{
+			name: "bare-key",
+			yaml: `
+endpoints:
+  - name: website
+    url: https://example.org
+    interval: 1h
+    failed-state:
+    conditions:
+      - "[STATUS] == 200"`,
+			expectedErr: endpoint.ErrFailedStateWithNoValue,
+		},
+		{
+			name: "interval-not-indented-under-failed-state",
+			yaml: `
+endpoints:
+  - name: website
+    url: https://example.org
+    failed-state:
+    interval: 5m
+    conditions:
+      - "[STATUS] == 200"`,
+			expectedErr: endpoint.ErrFailedStateWithNoValue,
+		},
+		{
+			name: "bare-key-on-external-endpoint",
+			yaml: `
+endpoints:
+  - name: website
+    url: https://example.org
+    conditions:
+      - "[STATUS] == 200"
+external-endpoints:
+  - name: ext
+    token: potato
+    failed-state:`,
+			expectedErr: endpoint.ErrFailedStateNotSupportedForExternalEndpoints,
+		},
+		{
+			name: "bare-key-on-suite-endpoint",
+			yaml: `
+suites:
+  - name: suite
+    endpoints:
+      - name: step
+        url: https://example.org
+        failed-state:
+        conditions:
+          - "[STATUS] == 200"`,
+			expectedErr: endpoint.ErrFailedStateWithNoValue,
+		},
+		{
+			name: "interval-not-shorter-than-endpoint-interval",
+			yaml: `
+endpoints:
+  - name: website
+    url: https://example.org
+    interval: 5m
+    failed-state:
+      interval: 10m
+    conditions:
+      - "[STATUS] == 200"`,
+			expectedErr: endpoint.ErrFailedStateIntervalNotShorterThanInterval,
+		},
+		{
+			name: "domain-expiration",
+			yaml: `
+endpoints:
+  - name: website
+    url: https://example.org
+    interval: 1h
+    failed-state:
+      interval: 1m
+    conditions:
+      - "[DOMAIN_EXPIRATION] > 720h"`,
+			expectedErr: endpoint.ErrFailedStateIntervalTooLowForDomainExpirationPlaceholder,
+		},
+		{
+			name: "external-endpoint",
+			yaml: `
+endpoints:
+  - name: website
+    url: https://example.org
+    conditions:
+      - "[STATUS] == 200"
+external-endpoints:
+  - name: ext
+    token: potato
+    failed-state:
+      interval: 1m`,
+			expectedErr: endpoint.ErrFailedStateNotSupportedForExternalEndpoints,
+		},
+		{
+			name: "suite-endpoint",
+			yaml: `
+suites:
+  - name: suite
+    endpoints:
+      - name: step
+        url: https://example.org
+        failed-state:
+          interval: 1m
+        conditions:
+          - "[STATUS] == 200"`,
+			expectedErr: endpoint.ErrFailedStateNotSupportedForSuiteEndpoints,
+		},
+	}
+	for _, scenario := range scenarios {
+		t.Run(scenario.name, func(t *testing.T) {
+			_, err := parseAndValidateConfigBytes([]byte(scenario.yaml))
+			if !errors.Is(err, scenario.expectedErr) {
+				t.Fatalf("expected error %v, got %v", scenario.expectedErr, err)
+			}
+		})
+	}
+}

@@ -1,12 +1,14 @@
 package endpoint
 
 import (
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/TwiN/gatus/v5/alerting/alert"
 	"github.com/TwiN/gatus/v5/config/endpoint/heartbeat"
 	"github.com/TwiN/gatus/v5/config/maintenance"
+	"gopkg.in/yaml.v3"
 )
 
 func TestExternalEndpoint_ValidateAndSetDefaults(t *testing.T) {
@@ -404,4 +406,32 @@ func TestExternalEndpoint_ValidationEdgeCases(t *testing.T) {
 // Helper function to create bool pointers
 func boolPtr(b bool) *bool {
 	return &b
+}
+
+func TestExternalEndpoint_ValidateAndSetDefaultsWithFailedState(t *testing.T) {
+	ee := &ExternalEndpoint{Name: "ext", Token: "token", FailedState: &FailedState{Interval: time.Minute}}
+	if err := ee.ValidateAndSetDefaults(); !errors.Is(err, ErrFailedStateNotSupportedForExternalEndpoints) {
+		t.Fatalf("expected error %v, got %v", ErrFailedStateNotSupportedForExternalEndpoints, err)
+	}
+	// Even an empty block must be rejected rather than silently ignored
+	ee = &ExternalEndpoint{Name: "ext", Token: "token", FailedState: &FailedState{}}
+	if err := ee.ValidateAndSetDefaults(); !errors.Is(err, ErrFailedStateNotSupportedForExternalEndpoints) {
+		t.Fatalf("expected error %v, got %v", ErrFailedStateNotSupportedForExternalEndpoints, err)
+	}
+	// So must a bare key with no value
+	ee = nil
+	if err := yaml.Unmarshal([]byte("name: ext\ntoken: token\nfailed-state:\n"), &ee); err != nil {
+		t.Fatal("failed to unmarshal:", err)
+	}
+	if err := ee.ValidateAndSetDefaults(); !errors.Is(err, ErrFailedStateNotSupportedForExternalEndpoints) {
+		t.Fatalf("expected error %v, got %v", ErrFailedStateNotSupportedForExternalEndpoints, err)
+	}
+	// Omitting it is fine
+	ee = nil
+	if err := yaml.Unmarshal([]byte("name: ext\ntoken: token\n"), &ee); err != nil {
+		t.Fatal("failed to unmarshal:", err)
+	}
+	if err := ee.ValidateAndSetDefaults(); err != nil {
+		t.Fatal("expected no error, got", err)
+	}
 }

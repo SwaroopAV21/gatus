@@ -26,6 +26,7 @@ import (
 	"github.com/TwiN/gatus/v5/config/key"
 	"github.com/TwiN/gatus/v5/config/maintenance"
 	"golang.org/x/crypto/ssh"
+	"gopkg.in/yaml.v3"
 )
 
 type Type string
@@ -109,6 +110,10 @@ type Endpoint struct {
 	// Interval is the duration to wait between every status check
 	Interval time.Duration `yaml:"interval,omitempty"`
 
+	// FailedState is the configuration that only applies while the endpoint is failing (e.g. a shorter interval
+	// between rechecks so that a recovery is noticed sooner). See FailedState for details.
+	FailedState *FailedState `yaml:"failed-state,omitempty"`
+
 	// Conditions used to determine the health of the endpoint
 	Conditions []Condition `yaml:"conditions"`
 
@@ -150,6 +155,27 @@ type Endpoint struct {
 	// AlwaysRun defines whether to execute this endpoint even if previous endpoints in the suite failed
 	// This field is only used when the endpoint is part of a suite
 	AlwaysRun bool `yaml:"always-run,omitempty"`
+
+	// failedStateSetToNull is whether the failed-state key was present in the configuration, but with no value.
+	// See UnmarshalYAML.
+	failedStateSetToNull bool
+}
+
+// UnmarshalYAML decodes the endpoint exactly like the default decoder would, and additionally records whether the
+// failed-state key was present with no value, so that ValidateAndSetDefaults can reject it rather than silently
+// ignoring it. See isFailedStateSetToNull.
+func (e *Endpoint) UnmarshalYAML(node *yaml.Node) error {
+	// endpointWithoutUnmarshaler has the same fields as Endpoint but not its methods, which prevents infinite recursion
+	type endpointWithoutUnmarshaler Endpoint
+	if err := node.Decode((*endpointWithoutUnmarshaler)(e)); err != nil {
+		return err
+	}
+	isNull, err := isFailedStateSetToNull(node)
+	if err != nil {
+		return err
+	}
+	e.failedStateSetToNull = isNull
+	return nil
 }
 
 // IsEnabled returns whether the endpoint is enabled or not
@@ -243,6 +269,14 @@ func (e *Endpoint) ValidateAndSetDefaults() error {
 	}
 	for _, maintenanceWindow := range e.MaintenanceWindows {
 		if err := maintenanceWindow.ValidateAndSetDefaults(); err != nil {
+			return err
+		}
+	}
+	if e.failedStateSetToNull {
+		return ErrFailedStateWithNoValue
+	}
+	if e.FailedState != nil {
+		if err := e.FailedState.ValidateAndSetDefaults(e); err != nil {
 			return err
 		}
 	}
