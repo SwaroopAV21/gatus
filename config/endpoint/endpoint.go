@@ -109,6 +109,10 @@ type Endpoint struct {
 	// Interval is the duration to wait between every status check
 	Interval time.Duration `yaml:"interval,omitempty"`
 
+	// FailedState is the optional configuration for additional checks while the endpoint is failing.
+	// If nil, the endpoint is only ever checked every Interval.
+	FailedState *FailedStateConfig `yaml:"failed-state,omitempty"`
+
 	// Conditions used to determine the health of the endpoint
 	Conditions []Condition `yaml:"conditions"`
 
@@ -239,6 +243,11 @@ func (e *Endpoint) ValidateAndSetDefaults() error {
 		}
 		if err := c.Validate(); err != nil {
 			return fmt.Errorf("%v: %w", ErrInvalidConditionFormat, err)
+		}
+	}
+	if e.FailedState != nil {
+		if err := e.FailedState.validate(e.Interval, e.needsToRetrieveDomainExpiration()); err != nil {
+			return err
 		}
 	}
 	for _, maintenanceWindow := range e.MaintenanceWindows {

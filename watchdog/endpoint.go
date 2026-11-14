@@ -13,6 +13,12 @@ import (
 
 // monitorEndpoint a single endpoint in a loop
 func monitorEndpoint(ep *endpoint.Endpoint, cfg *config.Config, extraLabels []string, ctx context.Context) {
+	if ep.FailedState != nil {
+		// Endpoints with a failed-state configuration need a scheduler that can check more often while failing.
+		// Endpoints without one keep using the plain ticker below.
+		monitorEndpointWithFailedState(ep, cfg, extraLabels, ctx, realClock{})
+		return
+	}
 	// Run it immediately on start
 	executeEndpoint(ep, cfg, extraLabels)
 	// Loop for the next executions
@@ -32,18 +38,20 @@ func monitorEndpoint(ep *endpoint.Endpoint, cfg *config.Config, extraLabels []st
 	// periodically like they are for normal endpoints.
 }
 
-func executeEndpoint(ep *endpoint.Endpoint, cfg *config.Config, extraLabels []string) {
+// executeEndpoint runs a regular check of the endpoint: it evaluates the endpoint's health, stores the result and
+// handles alerting. It returns the stored result, or nil if the check was skipped (shutdown or no connectivity).
+func executeEndpoint(ep *endpoint.Endpoint, cfg *config.Config, extraLabels []string) *endpoint.Result {
 	// Acquire semaphore to limit concurrent endpoint monitoring
 	if err := monitoringSemaphore.Acquire(ctx, 1); err != nil {
 		// Only fails if context is cancelled (during shutdown)
 		logr.Debugf("[watchdog.executeEndpoint] Context cancelled, skipping execution: %s", err.Error())
-		return
+		return nil
 	}
 	defer monitoringSemaphore.Release(1)
 	// If there's a connectivity checker configured, check if Gatus has internet connectivity
 	if cfg.Connectivity != nil && cfg.Connectivity.Checker != nil && !cfg.Connectivity.Checker.IsConnected() {
 		logr.Infof("[watchdog.executeEndpoint] No connectivity; skipping execution")
-		return
+		return nil
 	}
 	logr.Debugf("[watchdog.executeEndpoint] Monitoring group=%s; endpoint=%s; key=%s", ep.Group, ep.Name, ep.Key())
 	result := ep.EvaluateHealth()
@@ -69,6 +77,7 @@ func executeEndpoint(ep *endpoint.Endpoint, cfg *config.Config, extraLabels []st
 		logr.Debug("[watchdog.executeEndpoint] Not handling alerting because currently in the maintenance window")
 	}
 	logr.Debugf("[watchdog.executeEndpoint] Waiting for interval=%s before monitoring group=%s endpoint=%s (key=%s) again", ep.Interval, ep.Group, ep.Name, ep.Key())
+	return result
 }
 
 // UpdateEndpointStatus persists the endpoint result in the storage

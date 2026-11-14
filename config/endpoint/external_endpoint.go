@@ -43,6 +43,11 @@ type ExternalEndpoint struct {
 	// Heartbeat is the configuration that checks if the external endpoint has received new results when it should have.
 	Heartbeat heartbeat.Config `yaml:"heartbeat,omitempty"`
 
+	// FailedState is not supported for external endpoints. The field only exists so that a failed-state block on an
+	// external endpoint is rejected with ErrFailedStateNotSupportedForExternalEndpoint instead of being silently
+	// ignored by the YAML parser.
+	FailedState *FailedStateConfig `yaml:"failed-state,omitempty"`
+
 	// NumberOfFailuresInARow is the number of unsuccessful evaluations in a row
 	NumberOfFailuresInARow int `yaml:"-"`
 
@@ -64,6 +69,9 @@ func (externalEndpoint *ExternalEndpoint) ValidateAndSetDefaults() error {
 	}
 	if len(externalEndpoint.Token) == 0 {
 		return ErrExternalEndpointWithNoToken
+	}
+	if externalEndpoint.FailedState != nil {
+		return ErrFailedStateNotSupportedForExternalEndpoint
 	}
 	if externalEndpoint.Heartbeat.Interval != 0 && externalEndpoint.Heartbeat.Interval < 10*time.Second {
 		// If the heartbeat interval is set (non-0), it must be at least 10 seconds.

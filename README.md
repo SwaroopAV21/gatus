@@ -44,6 +44,7 @@ Have any feedback or questions? [Create a discussion](https://github.com/TwiN/ga
 - [Usage](#usage)
 - [Configuration](#configuration)
   - [Endpoints](#endpoints)
+    - [Checking failing endpoints more often](#checking-failing-endpoints-more-often)
   - [External Endpoints](#external-endpoints)
   - [Suites (ALPHA)](#suites-alpha)
   - [Conditions](#conditions)
@@ -285,6 +286,7 @@ You can then configure alerts to be triggered when an endpoint is unhealthy once
 | `endpoints[].method`                            | Request method.                                                                                                                             | `GET`                      |
 | `endpoints[].conditions`                        | Conditions used to determine the health of the endpoint. <br />See [Conditions](#conditions).                                               | `[]`                       |
 | `endpoints[].interval`                          | Duration to wait between every status check.                                                                                                | `60s`                      |
+| `endpoints[].failed-state.interval`             | Duration to wait between additional checks while the endpoint is failing. <br />See [Checking failing endpoints more often](#checking-failing-endpoints-more-often). | `""`                       |
 | `endpoints[].graphql`                           | Whether to wrap the body in a query param (`{"query":"$body"}`).                                                                            | `false`                    |
 | `endpoints[].body`                              | Request body.                                                                                                                               | `""`                       |
 | `endpoints[].headers`                           | Request headers.                                                                                                                            | `{}`                       |
@@ -316,6 +318,130 @@ You may use the following placeholders in the body (`endpoints[].body`):
 - `[ENDPOINT_URL]` (resolved from `endpoints[].url`)
 - `[LOCAL_ADDRESS]` (resolves to the local IP and port like `192.0.2.1:25` or `[2001:db8::1]:80`)
 - `[RANDOM_STRING_N]` (resolves to a random string of numbers and letters of length N (max: 8192))
+
+#### Checking failing endpoints more often
+If an endpoint has a long `interval` (e.g. because the target is rate limited or expensive to check), a failure keeps
+showing on the dashboard, and its alert stays open, until the next check, even if the endpoint recovered right after.
+`failed-state` adds checks on a shorter interval that only run while the endpoint is failing, so that a recovery is
+noticed sooner:
+
+```yaml
+endpoints:
+  - name: expensive-api
+    url: "https://example.org/health"
+    interval: 1h
+    failed-state:
+      interval: 5m
+    conditions:
+      - "[STATUS] == 200"
+    alerts:
+      - type: slack
+        send-on-resolved: true
+```
+
+| Parameter                             | Description                                                                                                                         | Default       |
+|:--------------------------------------|:------------------------------------------------------------------------------------------------------------------------------------|:--------------|
+| `endpoints[].failed-state`            | Configuration for additional checks while the endpoint is failing. If omitted, the endpoint is only checked every `interval`.        | `nil`         |
+| `endpoints[].failed-state.interval`   | Duration between checks while the endpoint is failing. Must be greater than `0` and lower than `endpoints[].interval`.              | Required `""` |
+
+The checks that run every `interval` are called *regular checks* below, and the additional ones *failed-state checks*.
+Endpoints without `failed-state` behave exactly as before.
+
+**When failed-state checks run.** They run while the last stored result is a failure (i.e. while the dashboard
+shows the endpoint as down), and while one of the endpoint's alerts is still triggered, which can take more than one
+success depending on `success-threshold`. A failed-state check is due `failed-state.interval` after the previous
+check of any kind was due, and it is skipped if it would fall at or after the next regular check, so a failed-state
+check never lands on top of a regular check. Regular checks keep their schedule: as without `failed-state`, they are
+due every `interval` from the end of the first check after Gatus starts or reloads its configuration. The
+failed-state checks that follow that first check are counted from its end too, so the first cycle follows the same
+pattern as the others. For example, with `interval: 1h`, and times measured from the first failed check at 0:00 (or,
+if that is the first check after a start, from its end):
+- `failed-state.interval: 5m`: 0:05, 0:10, ..., 0:55, then the regular check at 1:00, 1:05, ...
+- `failed-state.interval: 40m`: 0:40, then the regular check at 1:00, then 1:40, 2:00, 2:40, ...
+- `failed-state.interval: 30m`: 0:30, then the regular check at 1:00 (not a second check at 1:00), then 1:30, ...
+
+These are the times at which checks are due. Like regular checks, failed-state checks go through the
+[concurrency](#concurrency) limit and the [connectivity](#connectivity) checker, so a check may start later than
+that, or be skipped while there is no connectivity.
+
+**How they interact with alerting.** Failed-state checks only exist to notice a recovery sooner, so:
+- A **failed** failed-state check never counts toward `failure-threshold`, and never triggers an alert or sends a
+  reminder. Only regular checks do, so every alert still needs `failure-threshold` failed regular checks in a row,
+  and reminders (`minimum-reminder-interval`) come at most as often as without `failed-state`.
+- A **failed** failed-state check is not stored and not published as a metric, so it doesn't show up in the
+  history and doesn't drag the uptime down. The one exception is a failure that flips the dashboard from up to down
+  (e.g. the endpoint recovered at the previous check and failed again): it is stored so that the dashboard doesn't
+  keep showing the endpoint as up. It still doesn't count toward `failure-threshold` and doesn't send anything.
+- A **failed** failed-state check does reset the success streak, so `success-threshold` still means that many
+  successes *in a row*.
+- A **successful** failed-state check counts exactly like a successful regular check: it is stored, published as a
+  metric, and counts toward `success-threshold`. When the threshold is reached, the alert is resolved as usual
+  (including the notification if `send-on-resolved` is `true`), and failed-state checks stop.
+- Because a successful failed-state check counts like a regular one, it also **resets the failure streak**. If an
+  endpoint fails, briefly recovers between two regular checks and fails again, that recovery is now seen and resets
+  the streak, so the alert comes **later, or not at all, but never sooner** than without `failed-state`: every alert
+  still needs `failure-threshold` failed regular checks in a row. For the same reason, a brief recovery that reaches
+  `success-threshold` resolves the alert, so what regular checks alone would have reported as one long outage can be
+  reported as two.
+
+**Example.** With the configuration above, which uses the default `failure-threshold` of 3 and `success-threshold`
+of 2, and an endpoint that is down from the first failed check at 0:00 until 3:12:
+
+| Time       | Check                                  | Result   | What happens                                                                                             |
+|:-----------|:---------------------------------------|:---------|:---------------------------------------------------------------------------------------------------------|
+| 0:00       | regular                                | failure  | Stored. Failure 1 of 3. Failed-state checks start.                                                       |
+| 0:05-0:55  | failed-state, every 5m                 | failure  | Not stored, not counted.                                                                                 |
+| 1:00       | regular                                | failure  | Stored. Failure 2 of 3.                                                                                  |
+| 1:05-1:55  | failed-state, every 5m                 | failure  | Not stored, not counted.                                                                                 |
+| 2:00       | regular                                | failure  | Stored. Failure 3 of 3: the alert is **triggered**.                                                      |
+| 2:05-2:55  | failed-state, every 5m                 | failure  | Not stored, not counted, no reminders.                                                                   |
+| 3:00       | regular                                | failure  | Stored. Sends a reminder if `minimum-reminder-interval` is set and due, as without `failed-state`.       |
+| 3:05, 3:10 | failed-state                           | failure  | Not stored, not counted.                                                                                 |
+| 3:15       | failed-state                           | success  | Stored: the dashboard shows the endpoint as up. Success 1 of 2.                                          |
+| 3:20       | failed-state                           | success  | Stored. Success 2 of 2: the alert is **resolved** and the notification sent. Failed-state checks stop.   |
+| 4:00       | regular                                | success  | Stored. Back to checking every hour.                                                                     |
+
+Without `failed-state`, the recovery would only show up at 4:00, and the alert would be resolved at 5:00.
+The alert is triggered at the same time (2:00) either way, and of the 42 checks up to 4:00, only 7 results are
+stored, instead of 5 without `failed-state`.
+
+If instead the endpoint were down at 0:00 and 1:00, up at the 1:15 failed-state check, and down again from then on,
+the 1:15 success would reset the failure streak: the alert would be triggered at 4:00 (the failed regular checks at
+2:00, 3:00 and 4:00) instead of 2:00.
+
+If, after the alert was triggered at 2:00, the endpoint were up at 2:15, down at 2:20 and up again from 2:25 on, the
+2:20 failure would be stored (the dashboard went from up to down) and would reset the success streak, but would not
+count toward `failure-threshold` or send anything. The alert would be resolved at 2:30, by the two successes in a row
+at 2:25 and 2:30.
+
+**Uptime.** Uptime is calculated as the share of successful stored results, so the successes stored by failed-state
+checks during a recovery count toward it (one per check until the alert is resolved, or only the first one if no
+alert is triggered), while failed failed-state checks mostly don't. This makes the uptime slightly higher than with
+regular checks alone. In the example above, the uptime over the 24 hours starting at 0:00 is 22/26 = 84.6% instead
+of 20/24 = 83.3% without `failed-state`.
+
+**Maintenance windows.** During a [maintenance window](#maintenance), alerting is not handled, for failed-state
+checks as for regular checks. While the last stored result is a failure, failed-state checks keep running during
+the window, so that a recovery still shows up on the dashboard. Once a success has been stored, they stop until the
+window is over, since an open alert can't be resolved during the window anyway. After the window, if an alert is
+still triggered, they resume until it is resolved. For example, with the configuration above, an endpoint that is
+down from 0:00 until 3:12, and a maintenance window from 2:30 to 3:40:
+- The alert is triggered at 2:00, before the window.
+- From 2:30, failed-state checks keep running. The success at 3:15 is stored, so the dashboard shows the endpoint
+  as up, but doesn't count toward `success-threshold`, because of the window.
+- There are no checks from 3:20 to 3:35.
+- The window ends at 3:40. The failed-state checks at 3:40 and 3:45 succeed and resolve the alert at 3:45.
+
+**Other notes.**
+- `failed-state` is only supported for endpoints. It is rejected for [external endpoints](#external-endpoints),
+  which Gatus doesn't check itself, and for endpoints in a [suite](#suites-alpha), which run on the suite's interval.
+- If a condition uses `[DOMAIN_EXPIRATION]`, `failed-state.interval` must be at least `5m`, like `interval`,
+  because every check also queries WHOIS.
+- The dashboard, and the `/api/v1/endpoints/statuses` API it uses, can show a recovery up to 10 seconds after it
+  has been stored, because Gatus caches the responses of that API for 10 seconds.
+- Whether failed-state checks are running isn't persisted. After a restart or a configuration reload, the first
+  check decides: failed-state checks run if it fails, or if a triggered alert was loaded from storage.
+
 
 ### External Endpoints
 Unlike regular endpoints, external endpoints are not monitored by Gatus, but they are instead pushed programmatically.
@@ -817,6 +943,10 @@ Alerts are configured at the endpoint level like so:
 | `alerts[].send-on-resolved`          | Whether to send a notification once a triggered alert is marked as resolved.                                                                              | `false`       |
 | `alerts[].description`               | Description of the alert. Will be included in the alert sent.                                                                                             | `""`          |
 | `alerts[].provider-override`         | Alerting provider configuration override for the given alert type                                                                                         | `{}`          |
+
+> 📝 For endpoints with `failed-state`, only regular checks count toward `failure-threshold` and send reminders,
+> while successful failed-state checks count toward `success-threshold`.
+> See [Checking failing endpoints more often](#checking-failing-endpoints-more-often).
 
 Here's an example of what an alert configuration might look like at the endpoint level:
 ```yaml
@@ -2878,6 +3008,9 @@ endpoints:
         duration: 1h
         timezone: "Europe/Berlin"
 ```
+
+For how maintenance windows affect the additional checks of endpoints with `failed-state`, see
+[Checking failing endpoints more often](#checking-failing-endpoints-more-often).
 
 
 ### Security

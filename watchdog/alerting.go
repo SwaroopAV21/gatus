@@ -116,3 +116,23 @@ func handleAlertsToResolve(ep *endpoint.Endpoint, result *endpoint.Result, alert
 	}
 	ep.NumberOfFailuresInARow = 0
 }
+
+// handleFailedStateCheckFailure handles a failed failed-state check (see endpoint.FailedStateConfig).
+//
+// Unlike handleAlertsToTrigger, it does not count the failure toward any alert's failure-threshold, and it never
+// sends an alert or a reminder: failed-state checks only exist to notice a recovery sooner. It only resets the
+// success streak, so that an alert still needs success-threshold successes in a row to be resolved.
+func handleFailedStateCheckFailure(ep *endpoint.Endpoint, alertingConfig *alerting.Config) {
+	if alertingConfig == nil || ep.NumberOfSuccessesInARow == 0 {
+		return
+	}
+	ep.NumberOfSuccessesInARow = 0
+	for _, endpointAlert := range ep.Alerts {
+		if endpointAlert.IsEnabled() && endpointAlert.Triggered {
+			// Persist the reset of NumberOfSuccessesInARow, so that a restart doesn't resume from a stale streak
+			if err := store.Get().UpsertTriggeredEndpointAlert(ep, endpointAlert); err != nil {
+				logr.Errorf("[watchdog.handleFailedStateCheckFailure] Failed to update triggered endpoint alert for endpoint with key=%s: %s", ep.Key(), err.Error())
+			}
+		}
+	}
+}

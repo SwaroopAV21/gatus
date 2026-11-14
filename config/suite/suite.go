@@ -86,6 +86,10 @@ func (s *Suite) ValidateAndSetDefaults() error {
 			return fmt.Errorf("%w: duplicate endpoint name '%s'", ErrSuiteWithDuplicateEndpointNames, ep.Name)
 		}
 		endpointNames[ep.Name] = true
+		// Suite endpoints are executed on the suite's interval, so failed-state cannot apply to them
+		if ep.FailedState != nil {
+			return fmt.Errorf("invalid endpoint '%s': %w", ep.Name, endpoint.ErrFailedStateNotSupportedForSuiteEndpoint)
+		}
 		// Suite endpoints inherit the group from the suite
 		ep.Group = s.Group
 		// Validate each endpoint
